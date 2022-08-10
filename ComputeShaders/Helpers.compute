@@ -1,0 +1,51 @@
+#ifndef HELPERS
+#define HELPERS
+
+float remap(float x, float minOld, float maxOld, float minNew, float maxNew)
+{
+    x = clamp(x, minOld, maxOld);
+    return minNew + (x - minOld) * (maxNew - minNew) / (maxOld - minOld);
+}
+
+float3 normalizesafe(float3 vec)
+{
+    float len = length(vec);
+
+    return len == 0 ? float3(0, 0, 0) : vec / len;
+}
+
+bool approx(float a, float b)
+{
+    const float precision = 0.01;
+    return abs(a - b) < precision;
+}
+
+bool approx(float3 a, float3 b)
+{
+    return approx(a.x, b.x) && approx(a.y, b.y) && approx(a.z, b.z);
+}
+
+float4x4 ToFloat4x4(float3x3 m)
+{
+    return float4x4(
+        m[0][0], m[1][0], m[2][0], 0,
+        m[0][1], m[1][1], m[2][1], 0,
+        m[0][2], m[1][2], m[2][2], 0,
+        0, 0, 0, 1);
+}
+
+float4x4 LookRotation(float3 forward)
+{
+    float3 r0 = normalize(cross(vector3Up, forward));
+    float3 r1 = cross(forward, r0);
+    float3 r2 = forward;
+
+    float3x3 rot3D = float3x3(
+        r0.x, r0.y, r0.z,
+        r1.x, r1.y, r1.z,
+        r2.x, r2.y, r2.z);
+    
+    return ToFloat4x4(rot3D);
+}
+
+#endif

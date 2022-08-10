@@ -1,0 +1,444 @@
+#include "Assets/GPUInstancer/Resources/Compute/Include/PlatformDefines.compute"
+#include "Assets/GPUInstancer/Resources/Compute/Include/Matrix.compute"
+#include "Assets/GPUInstancer/Resources/Compute/Include/DataModel.compute"
+#include "Helpers.compute"
+
+#pragma kernel CSMain
+
+struct DebugData
+{
+    float3 cohesionVec;
+    float cohesionLen;
+    float cohesionFrac;
+    float cohesionFinalWeight;
+    float3 separationVec;
+    float separationLen;
+    float separationFrac;
+    float separationFinalWeight;
+    float3 alignmentVec;
+    float alignmentLen;
+    float alignmentFrac;
+    float alignmentFinalWeight;
+    float3 boundAvoidance;
+    float boundAvoidanceFrac;
+    float boundAvoidFinalWeight;
+    float3 obstacleAvoidance;
+    float obstacleAvoidanceFrac;
+    float obstacleAvoidanceFinalWeight;
+    float weightSum;
+    int visibleBoids;
+    float cohesionInfl;
+    float alignmentInfl;
+    float separationInfl;
+    float boundAvoidInfl;
+    float obstacleAvoidInfl;
+    float3 velocity;
+    float speedTarget;
+    float speedCurrent;
+    float dynamicObstacleAvoidanceFrac;
+    int visibleDynamicObstacles;
+    float animTime;
+    float animTimeMultiplier;
+    float angleDiff;
+    float angleFlappingMultiplier;
+    float speedDiff;
+    float speedFlappingMultiplier;
+    float speedAngleMultiplier;
+};
+
+RWStructuredBuffer<float4x4> gpuiPosBuffer;
+RWStructuredBuffer<float3> boidPosBuffer;
+RWStructuredBuffer<float3> boidVelBuffer;
+RWStructuredBuffer<float3> obstacleAvoidanceVec;
+RWStructuredBuffer<float2> animDataBuffer; // x - animMultiplier, y - animTime
+RWStructuredBuffer<DebugData> debugDataBuffer;
+RWStructuredBuffer<float3> dynamicObstaclePosBuffer;
+
+const float cosCycle = 6.28f * 1000;
+uniform float dt;
+uniform uint constantBufferStartIdx;
+uniform uint gpuiBufferStartIdx;
+uniform uint groupCount;
+
+uniform float visionAngleDot;
+uniform float visionDistance;
+uniform int maxVisibleBoidsCount;
+uniform float speed;
+uniform float maxSpeed;
+uniform float maxCatchupSpeedBonusPercent;
+uniform float maxDynamicObstacleAvoidanceSpeedBonusPercent;
+uniform float speedAlignmentLerp;
+uniform float separationTreshold;
+uniform float boundDistTreshold;
+uniform float velLerpValue;
+uniform float flappingLerpIncrease;
+uniform float flappingLerpDecrease;
+uniform float flappingTimescaleMultiplier;
+uniform float flappingMultiplierSpeedRef;
+uniform float flappingMultiplierAngleRef;
+uniform float speedMultiplierAngleRef;
+uniform float minAngleSpeedMultiplier;
+
+uniform float cohesionWeight;
+uniform float separationWeight;
+uniform float alignmentWeight;
+uniform float boundAvoidanceWeight;
+uniform float obstacleAvoidanceWeight;
+uniform float3 scale;
+
+uniform float3 boundsMin;
+uniform float3 boundsMax;
+
+uniform float dynamicObstacleRadius;
+uniform int dynamicObstacleCount;
+uniform float dynamicObstacleAvoidanceTreshold;
+uniform float dynamicObstacleMaxLerpBonus;
+uniform float dynamicObstacleMinFrac;
+
+int ConstantBufferIdx(int groupIdx)
+{
+    return constantBufferStartIdx + groupIdx;
+}
+
+int GPUIBufferIdx(int groupIdx)
+{
+    return gpuiBufferStartIdx + groupIdx;
+}
+
+float3 GetAccelAgainstWall(float boundPos, float boidPos, float distTreshold,
+                           bool smallerPosInside, float3 pushDir)
+{
+    if (boidPos >= boundPos && smallerPosInside ||
+        boidPos < boundPos && !smallerPosInside)
+    {
+        return pushDir;
+    }
+
+    float signedDist = boundPos - boidPos;
+    float dist = abs(signedDist);
+    if (dist < distTreshold)
+    {
+        return pushDir * (1 - dist / distTreshold);
+    }
+
+    return float3(0, 0, 0);
+}
+
+float3 GetAvoidanceAccelAgainstAllWallsForPos(float3 pos)
+{
+    return GetAccelAgainstWall(boundsMin.x, pos.x, boundDistTreshold, false, float3(1, 0, 0)) + // Right
+        GetAccelAgainstWall(boundsMax.x, pos.x, boundDistTreshold, true, float3(-1, 0, 0)) + // Left
+        GetAccelAgainstWall(boundsMin.y, pos.y, boundDistTreshold, false, float3(0, 1, 0)) + // Up
+        GetAccelAgainstWall(boundsMax.y, pos.y, boundDistTreshold, true, float3(0, -1, 0)) + // Down
+        GetAccelAgainstWall(boundsMin.z, pos.z, boundDistTreshold, false, float3(0, 0, 1)) + // Forward
+        GetAccelAgainstWall(boundsMax.z, pos.z, boundDistTreshold, true, float3(0, 0, -1)); // Back
+}
+
+float3 RotateWithRule(float3 currDir, float3 ruleDir, float ruleInfluence)
+{
+    if (approx(currDir, -ruleDir))
+    {
+        float3x3 rotMatrix = MatrixRotate(float3(1, 1, 1), radians(5));
+        currDir = mul(rotMatrix, currDir);
+    }
+
+    float angleBetweenVectors = acos(dot(currDir, ruleDir));
+    float targetAngle = angleBetweenVectors * ruleInfluence;
+
+    float3 rotatedDir = currDir;
+    if (angleBetweenVectors != 0)
+    {
+        float3 d = normalizesafe(
+            cross(
+                cross(currDir, ruleDir),
+                currDir));
+        rotatedDir = cos(targetAngle) * currDir + sin(targetAngle) * d;
+    }
+
+    return isnan(rotatedDir) ? currDir : rotatedDir;
+}
+
+
+// TODO: Make boid data into array and send it once per species
+[numthreads(NUM_THREADS,1,1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= groupCount)
+        return;
+
+    uint thisGroupBoidIdx = id.x;
+    uint constantBufferIdx = ConstantBufferIdx(thisGroupBoidIdx);
+    uint gpuiBufferIdx = GPUIBufferIdx(thisGroupBoidIdx);
+    float3 posOld = boidPosBuffer[constantBufferIdx];
+    float3 velOld = boidVelBuffer[constantBufferIdx];
+    float3 dirOld = normalizesafe(velOld);
+    float2 animDataOld = animDataBuffer[thisGroupBoidIdx];
+    DebugData debugData;
+    debugData.cohesionInfl = 0;
+    debugData.alignmentInfl = 0;
+    debugData.separationInfl = 0;
+    debugData.boundAvoidInfl = 0;
+    debugData.obstacleAvoidInfl = 0;
+
+    float3 cohesionVec = float3(0, 0, 0);
+    float3 separationVec = float3(0, 0, 0);
+    float3 avgVel = float3(0, 0, 0);
+    uint visibleBoidCount = 0;
+    uint separationAccounted = 0;
+    for (uint otherBoidGroupIdx = 0; otherBoidGroupIdx < groupCount; otherBoidGroupIdx++)
+    {
+        if (otherBoidGroupIdx == thisGroupBoidIdx)
+            continue;
+
+        int otherBoidConstBuffIdx = ConstantBufferIdx(otherBoidGroupIdx);
+        float3 otherBoidPos = boidPosBuffer[otherBoidConstBuffIdx];
+        float3 toOtherBoidVec = otherBoidPos - posOld;
+        float3 toOtherBoidDir = normalizesafe(toOtherBoidVec);
+        float dist = length(toOtherBoidVec);
+
+        // Account separation if exceeded separation threshold (even if not inside vision cone)
+        if (dist <= separationTreshold)
+        {
+            float dirScaler = 1 - dist / separationTreshold;
+            separationVec -= toOtherBoidDir * dirScaler;
+
+            separationAccounted++;
+        }
+
+        // Don't account not visible boids to other rules
+        if (dist > visionDistance ||
+            dot(toOtherBoidDir, dirOld) < visionAngleDot)
+            continue;
+
+        float3 otherBoidVel = boidVelBuffer[otherBoidConstBuffIdx];
+
+        cohesionVec += otherBoidPos;
+        avgVel += otherBoidVel;
+
+
+        visibleBoidCount++;
+
+        if (visibleBoidCount == maxVisibleBoidsCount)
+            break;
+    }
+
+    debugData.visibleBoids = visibleBoidCount;
+
+    // Calculate Cohesion
+    cohesionVec = visibleBoidCount == 0 ? cohesionVec : cohesionVec / visibleBoidCount - posOld;
+    float cohesionLen = length(cohesionVec);
+    float cohesionFrac = remap(cohesionLen,
+                               0, visionDistance,
+                               0, 1);
+    float cohesionFinalWeight = cohesionWeight * cohesionFrac;
+    debugData.cohesionVec = cohesionVec;
+    debugData.cohesionLen = cohesionLen;
+    debugData.cohesionFrac = cohesionFrac;
+    debugData.cohesionFinalWeight = cohesionFinalWeight;
+
+    // Calculate Separation
+    separationVec = separationAccounted == 0 ? separationVec : separationVec / separationAccounted;
+    float separationLen = length(separationVec);
+    float separationFrac = remap(separationLen,
+                                 0, separationTreshold,
+                                 0, 1);
+    float separationFinalWeight = separationWeight * separationFrac;
+    debugData.separationVec = separationVec;
+    debugData.separationLen = separationLen;
+    debugData.separationFrac = separationFrac;
+    debugData.separationFinalWeight = separationFinalWeight;
+
+    // Calculate Alignment
+    avgVel = visibleBoidCount == 0 ? avgVel : avgVel / visibleBoidCount;
+    float alignmentLen = length(avgVel);
+    float alignmentFrac = remap(alignmentLen,
+                                0, speed,
+                                0, 1);
+    float alignmentFinalWeight = alignmentWeight * alignmentFrac;
+    debugData.alignmentVec = avgVel;
+    debugData.alignmentLen = alignmentLen;
+    debugData.alignmentFrac = alignmentFrac;
+    debugData.alignmentFinalWeight = alignmentFinalWeight;
+
+    // Calculate bound avoidance
+    float3 boundAvoidance = GetAvoidanceAccelAgainstAllWallsForPos(posOld) / 3 * boundDistTreshold;
+    // Temp fix - because it can get influence from 3 walls at once
+    float boundAvoidanceFrac = length(boundAvoidance) > 0 ? length(boundAvoidance) : 0;
+    float boundAvoidanceFinalWeight = boundAvoidanceWeight * boundAvoidanceFrac;
+    debugData.boundAvoidance = boundAvoidance;
+    debugData.boundAvoidanceFrac = boundAvoidanceFrac;
+    debugData.boundAvoidFinalWeight = boundAvoidanceFinalWeight;
+
+    // Calculate obstacle avoidance
+    // It is already normalized and scaled with distance to surface
+    float3 obstacleAvoidance = obstacleAvoidanceVec[constantBufferIdx];
+    float obstacleAvoidanceFrac = length(obstacleAvoidance);
+    float obstacleAvoidanceFinalWeight = obstacleAvoidanceWeight * obstacleAvoidanceFrac;
+    debugData.obstacleAvoidance = obstacleAvoidance;
+    debugData.obstacleAvoidanceFrac = obstacleAvoidanceFrac;
+    debugData.obstacleAvoidanceFinalWeight = obstacleAvoidanceFinalWeight;
+
+    // Calculate dynamic obstacle avoidance
+    float3 dynamicObstacleAvoidance = float3(0, 0, 0);
+    float dynamicObstacleAvoidanceFrac = 0;
+    for (int i = 0; i < dynamicObstacleCount; i++)
+    {
+        float3 obstaclePos = dynamicObstaclePosBuffer[i];
+        float3 toObstacleVec = obstaclePos - posOld;
+        float dist = length(toObstacleVec);
+        float radiusWithTreshold = dynamicObstacleRadius + dynamicObstacleAvoidanceTreshold;
+        if (dist > radiusWithTreshold)
+            continue;
+
+        float distClamped = max(dist, dynamicObstacleRadius);
+        dynamicObstacleAvoidanceFrac = remap(
+            (distClamped - dynamicObstacleRadius) / dynamicObstacleAvoidanceTreshold,
+            0, 1,
+            dynamicObstacleMinFrac, 1);
+        dynamicObstacleAvoidance = -toObstacleVec;
+
+        debugData.dynamicObstacleAvoidanceFrac = dynamicObstacleAvoidanceFrac;
+        debugData.visibleDynamicObstacles = 1;
+
+        break;
+    }
+    float dynamicObstacleAvoidanceFinalWeight = obstacleAvoidanceWeight * dynamicObstacleAvoidanceFrac;
+
+    // Calculate weight sum - for all rules with frac included
+    float weightSum = cohesionFinalWeight + alignmentFinalWeight + separationFinalWeight +
+        boundAvoidanceFinalWeight + obstacleAvoidanceFinalWeight + dynamicObstacleAvoidanceFinalWeight;
+    debugData.weightSum = weightSum;
+
+    // Init target dir as current dir and apply rules to it
+    float3 dirTarget = dirOld;
+
+    if (weightSum > 0)
+    {
+        // Apply cohesion
+        if (cohesionFinalWeight > 0)
+        {
+            float3 cohesionDir = normalizesafe(cohesionVec);
+            float cohesionInfl = cohesionFinalWeight / weightSum;
+            dirTarget = RotateWithRule(dirTarget, cohesionDir, cohesionInfl);
+            debugData.cohesionInfl = cohesionInfl;
+        }
+
+        // Apply alignment
+        if (alignmentFinalWeight > 0)
+        {
+            float3 alignmentDir = normalizesafe(avgVel);
+            float alignmentInfl = alignmentFinalWeight / weightSum;
+            dirTarget = RotateWithRule(dirTarget, alignmentDir, alignmentInfl);
+            debugData.alignmentInfl = alignmentInfl;
+        }
+
+        // Apply separation
+        if (separationFinalWeight > 0)
+        {
+            float3 separationDir = normalizesafe(separationVec);
+            float separationInfl = separationFinalWeight / weightSum;
+            dirTarget = RotateWithRule(dirTarget, separationDir, separationInfl);
+            debugData.separationInfl = separationInfl;
+        }
+
+        // Apply bounds avoidance
+        if (boundAvoidanceFinalWeight > 0)
+        {
+            float3 boundAvoidanceDir = normalizesafe(boundAvoidance);
+            float boundAvoidInfl = boundAvoidanceFinalWeight / weightSum;
+            dirTarget = RotateWithRule(dirTarget, boundAvoidanceDir, boundAvoidInfl);
+            debugData.boundAvoidInfl = boundAvoidInfl;
+        }
+
+        // Apply obstacle avoidance (it's already normalized)
+        if (obstacleAvoidanceFinalWeight > 0)
+        {
+            float3 obstacleAvoidDir = normalizesafe(obstacleAvoidance);
+            float obstacleAvoidInfl = obstacleAvoidanceFinalWeight / weightSum;
+            dirTarget = RotateWithRule(dirTarget, obstacleAvoidDir, obstacleAvoidInfl);
+            debugData.obstacleAvoidInfl = obstacleAvoidInfl;
+        }
+
+        // Apply dynamic obstacle avoidance
+        if (dynamicObstacleAvoidanceFinalWeight > 0)
+        {
+            float3 obstacleAvoidDir = normalizesafe(dynamicObstacleAvoidance);
+            float obstacleAvoidInfl = dynamicObstacleAvoidanceFinalWeight / weightSum;
+            dirTarget = RotateWithRule(dirTarget, obstacleAvoidDir, obstacleAvoidInfl);
+            // debugData.obstacleAvoidInfl = obstacleAvoidInfl;
+        }
+    }
+
+    // Lerp to target direction
+    float3 dirNew = RotateWithRule(dirOld, dirTarget, velLerpValue);
+    dirNew = isnan(dirNew) || isinf(dirNew) ? dirOld : dirNew;
+    dirTarget = isnan(dirTarget) || isinf(dirTarget) ? dirOld : dirTarget;
+
+    // Apply vel lerp bonuses
+    velLerpValue += dynamicObstacleMaxLerpBonus * dynamicObstacleAvoidanceFrac;
+    velLerpValue += dynamicObstacleMaxLerpBonus * obstacleAvoidanceFrac;
+
+    // Calculate angle diff
+    float angleDiff = acos(dot(dirNew, dirTarget));
+    angleDiff = isnan(angleDiff) || isinf(angleDiff) ? 0 : angleDiff;
+
+    // Calculate speed
+    float currentSpeed = length(velOld);
+    float speedTarget = speed;
+    speedTarget *= 1 + maxCatchupSpeedBonusPercent * cohesionFrac;
+    speedTarget *= 1 + maxDynamicObstacleAvoidanceSpeedBonusPercent * dynamicObstacleAvoidanceFrac;
+    speedTarget = lerp(speedTarget, length(avgVel), speedAlignmentLerp * 1 - cohesionFrac);
+    speedTarget = min(speedTarget, maxSpeed);
+
+    // Apply speed angle multiplier only when is not near dynamic obstacle
+    if (dynamicObstacleAvoidanceFrac < 0.3f)
+    {
+        float speedAngleMultiplier = remap(1 - min(angleDiff / speedMultiplierAngleRef, 1),
+                                           0, 1,
+                                           minAngleSpeedMultiplier, 1);
+        speedTarget *= speedAngleMultiplier;
+        
+        debugData.speedAngleMultiplier = speedAngleMultiplier;
+    }
+
+    float speedNew = lerp(currentSpeed, speedTarget, velLerpValue);
+
+    debugData.speedTarget = speedTarget;
+    debugData.speedCurrent = speedNew;
+
+    // Calculate velocity
+    float3 velNew = dirNew * speedNew;
+    debugData.velocity = velNew;
+
+    // Apply velocity
+    float3 posNew = posOld + velNew * dt;
+
+    // Calculate and set normalized flapping multiplier
+    float speedDiff = max(0, speedTarget - speedNew);
+    float speedFlappingMultiplier = speedDiff / flappingMultiplierSpeedRef;
+    float angleFlappingMultiplier = angleDiff / flappingMultiplierAngleRef;
+    float flappingMultiplierTarget = min(angleFlappingMultiplier + speedFlappingMultiplier, 1);
+    float flappingMultiplierOld = animDataOld.x;
+    float lerpVal = flappingMultiplierTarget < 0.1f ? flappingLerpDecrease : flappingLerpIncrease;
+    float flappingMultiplierNew = lerp(flappingMultiplierOld, flappingMultiplierTarget, lerpVal);
+
+    // Increase animTime
+    float animTimeOld = animDataOld.y;
+    float animTimeNew = animTimeOld + dt * (1 + flappingMultiplierNew * flappingTimescaleMultiplier);
+    animTimeNew = animTimeNew > cosCycle ? animTimeNew - cosCycle : animTimeNew;
+
+    debugData.angleDiff = angleDiff;
+    debugData.angleFlappingMultiplier = angleFlappingMultiplier;
+    debugData.speedDiff = speedDiff;
+    debugData.speedFlappingMultiplier = speedFlappingMultiplier;
+    debugData.animTimeMultiplier = flappingMultiplierNew;
+    debugData.animTime = animTimeNew;
+
+    // Store data in buffers
+    gpuiPosBuffer[gpuiBufferIdx] = TRS(posNew, LookRotation(dirNew), scale);
+
+    boidPosBuffer[constantBufferIdx] = posNew;
+    boidVelBuffer[constantBufferIdx] = velNew;
+    animDataBuffer[thisGroupBoidIdx] = float2(flappingMultiplierNew, animTimeNew);
+    debugDataBuffer[constantBufferIdx] = debugData;
+}
